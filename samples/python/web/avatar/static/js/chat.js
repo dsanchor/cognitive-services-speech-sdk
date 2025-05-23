@@ -2,160 +2,140 @@
 // Licensed under the MIT license.
 
 // Global objects
-var clientId
-var enableWebSockets
-var socket
-var audioContext
-var isFirstResponseChunk
 var speechRecognizer
+var avatarSynthesizer
 var peerConnection
 var peerConnectionDataChannel
-var speechSynthesizerConnected = false
+var messages = []
+var messageInitiated = false
+var dataSources = []
+var sentenceLevelPunctuations = ['.', '?', '!', ':', ';', '。', '？', '！', '：', '；']
+var enableDisplayTextAlignmentWithSpeech = true
+var enableQuickReply = false
+var quickReplies = ['Let me take a look.', 'Let me check.', 'One moment, please.']
+var byodDocRegex = new RegExp(/\[doc(\d+)\]/g)
 var isSpeaking = false
 var isReconnecting = false
+var speakingText = ""
+var spokenTextQueue = []
+var repeatSpeakingSentenceAfterReconnection = true
 var sessionActive = false
 var userClosedSession = false
-var recognitionStartedTime
-var chatRequestSentTime
-var chatResponseReceivedTime
 var lastInteractionTime = new Date()
 var lastSpeakTime
-var isFirstRecognizingEvent = true
-var sttLatencyRegex = new RegExp(/<STTL>(\d+)<\/STTL>/)
-var firstTokenLatencyRegex = new RegExp(/<FTL>(\d+)<\/FTL>/)
-var firstSentenceLatencyRegex = new RegExp(/<FSL>(\d+)<\/FSL>/)
+var imgUrl = ""
 
 // Connect to avatar service
 function connectAvatar() {
-    document.getElementById('startSession').disabled = true
+    const cogSvcRegion = document.getElementById('region').value
+    const cogSvcSubKey = document.getElementById('APIKey').value
+    if (cogSvcSubKey === '') {
+        alert('Please fill in the API key of your speech resource.')
+        return
+    }
 
-    fetch('/api/getIceToken', {
-        method: 'GET',
-    })
-    .then(response => {
-        if (response.ok) {
-            response.json().then(data => {
-                const iceServerUrl = data.Urls[0]
-                const iceServerUsername = data.Username
-                const iceServerCredential = data.Password
-                setupWebRTC(iceServerUrl, iceServerUsername, iceServerCredential)
-            })
-        } else {
-            throw new Error(`Failed fetching ICE token: ${response.status} ${response.statusText}`)
+    const privateEndpointEnabled = document.getElementById('enablePrivateEndpoint').checked
+    const privateEndpoint = document.getElementById('privateEndpoint').value.slice(8)
+    if (privateEndpointEnabled && privateEndpoint === '') {
+        alert('Please fill in the Azure Speech endpoint.')
+        return
+    }
+
+    let speechSynthesisConfig
+    if (privateEndpointEnabled) {
+        speechSynthesisConfig = SpeechSDK.SpeechConfig.fromEndpoint(new URL(`wss://${privateEndpoint}/tts/cognitiveservices/websocket/v1?enableTalkingAvatar=true`), cogSvcSubKey)
+    } else {
+        speechSynthesisConfig = SpeechSDK.SpeechConfig.fromSubscription(cogSvcSubKey, cogSvcRegion)
+    }
+    speechSynthesisConfig.endpointId = document.getElementById('customVoiceEndpointId').value
+
+    const talkingAvatarCharacter = document.getElementById('talkingAvatarCharacter').value
+    const talkingAvatarStyle = document.getElementById('talkingAvatarStyle').value
+    const avatarConfig = new SpeechSDK.AvatarConfig(talkingAvatarCharacter, talkingAvatarStyle)
+    avatarConfig.customized = document.getElementById('customizedAvatar').checked
+    avatarConfig.useBuiltInVoice = document.getElementById('useBuiltInVoice').checked
+    avatarSynthesizer = new SpeechSDK.AvatarSynthesizer(speechSynthesisConfig, avatarConfig)
+    avatarSynthesizer.avatarEventReceived = function (s, e) {
+        var offsetMessage = ", offset from session start: " + e.offset / 10000 + "ms."
+        if (e.offset === 0) {
+            offsetMessage = ""
         }
-    })
 
-    document.getElementById('configuration').hidden = true
-}
+        console.log("Event received: " + e.description + offsetMessage)
+    }
 
-// Create speech recognizer
-function createSpeechRecognizer() {
-    fetch('/api/getSpeechToken', {
-        method: 'GET',
-    })
-    .then(response => {
-        if (response.ok) {
-            const speechRegion = response.headers.get('SpeechRegion')
-            const speechPrivateEndpoint = response.headers.get('SpeechPrivateEndpoint')
-            response.text().then(text => {
-                const speechToken = text
-                const speechRecognitionConfig = speechPrivateEndpoint ?
-                    SpeechSDK.SpeechConfig.fromEndpoint(new URL(`wss://${speechPrivateEndpoint.replace('https://', '')}/stt/speech/universal/v2`), '') :
-                    SpeechSDK.SpeechConfig.fromEndpoint(new URL(`wss://${speechRegion}.stt.speech.microsoft.com/speech/universal/v2`), '')
-                speechRecognitionConfig.authorizationToken = speechToken
-                speechRecognitionConfig.setProperty(SpeechSDK.PropertyId.SpeechServiceConnection_LanguageIdMode, "Continuous")
-                speechRecognitionConfig.setProperty("SpeechContext-PhraseDetection.TrailingSilenceTimeout", "3000")
-                speechRecognitionConfig.setProperty("SpeechContext-PhraseDetection.InitialSilenceTimeout", "10000")
-                speechRecognitionConfig.setProperty("SpeechContext-PhraseDetection.Dictation.Segmentation.Mode", "Custom")
-                speechRecognitionConfig.setProperty("SpeechContext-PhraseDetection.Dictation.Segmentation.SegmentationSilenceTimeoutMs", "200")
-                var sttLocales = document.getElementById('sttLocales').value.split(',')
-                var autoDetectSourceLanguageConfig = SpeechSDK.AutoDetectSourceLanguageConfig.fromLanguages(sttLocales)
-                speechRecognizer = SpeechSDK.SpeechRecognizer.FromConfig(speechRecognitionConfig, autoDetectSourceLanguageConfig, SpeechSDK.AudioConfig.fromDefaultMicrophoneInput())
-            })
+    const speechRecognitionConfig = SpeechSDK.SpeechConfig.fromEndpoint(new URL(`wss://${cogSvcRegion}.stt.speech.microsoft.com/speech/universal/v2`), cogSvcSubKey)
+
+
+
+
+
+    speechRecognitionConfig.setProperty(SpeechSDK.PropertyId.SpeechServiceConnection_LanguageIdMode, "Continuous")
+    var sttLocales = document.getElementById('sttLocales').value.split(',')
+    var autoDetectSourceLanguageConfig = SpeechSDK.AutoDetectSourceLanguageConfig.fromLanguages(sttLocales)
+    speechRecognizer = SpeechSDK.SpeechRecognizer.FromConfig(speechRecognitionConfig, autoDetectSourceLanguageConfig, SpeechSDK.AudioConfig.fromDefaultMicrophoneInput())
+
+    const azureOpenAIEndpoint = document.getElementById('azureOpenAIEndpoint').value
+    const azureOpenAIApiKey = document.getElementById('azureOpenAIApiKey').value
+    const azureOpenAIDeploymentName = document.getElementById('azureOpenAIDeploymentName').value
+    if (azureOpenAIEndpoint === '' || azureOpenAIApiKey === '' || azureOpenAIDeploymentName === '') {
+        alert('Please fill in the Azure OpenAI endpoint, API key and deployment name.')
+        return
+    }
+
+    dataSources = []
+    if (document.getElementById('enableOyd').checked) {
+        const azureCogSearchEndpoint = document.getElementById('azureCogSearchEndpoint').value
+        const azureCogSearchApiKey = document.getElementById('azureCogSearchApiKey').value
+        const azureCogSearchIndexName = document.getElementById('azureCogSearchIndexName').value
+        if (azureCogSearchEndpoint === "" || azureCogSearchApiKey === "" || azureCogSearchIndexName === "") {
+            alert('Please fill in the Azure Cognitive Search endpoint, API key and index name.')
+            return
         } else {
-            throw new Error(`Failed fetching speech token: ${response.status} ${response.statusText}`)
-        }
-    })
-}
-
-// Disconnect from avatar service
-function disconnectAvatar(closeSpeechRecognizer = false) {
-    fetch('/api/disconnectAvatar', {
-        method: 'POST',
-        headers: {
-            'ClientId': clientId
-        },
-        body: ''
-    })
-
-    if (speechRecognizer !== undefined) {
-        speechRecognizer.stopContinuousRecognitionAsync()
-        if (closeSpeechRecognizer) {
-            speechRecognizer.close()
+            setDataSources(azureCogSearchEndpoint, azureCogSearchApiKey, azureCogSearchIndexName)
         }
     }
 
-    sessionActive = false
-}
+    // Only initialize messages once
+    if (!messageInitiated) {
+        initMessages()
+        messageInitiated = true
+    }
 
-function setupWebSocket() {
-    socket = io.connect(`${window.location.origin}?clientId=${clientId}`)
-    socket.on('connect', function() {
-        console.log('WebSocket connected.')
-    })
+    document.getElementById('startSession').disabled = true
+    document.getElementById('configuration').hidden = true
 
-    socket.on('response', function(data) {
-        let path = data.path
-        if (path === 'api.chat') {
-            lastInteractionTime = new Date()
-            let chatHistoryTextArea = document.getElementById('chatHistory')
-            let chunkString = data.chatResponse
-            if (sttLatencyRegex.test(chunkString)) {
-                let sttLatency = parseInt(sttLatencyRegex.exec(chunkString)[0].replace('<STTL>', '').replace('</STTL>', ''))
-                console.log(`STT latency: ${sttLatency} ms`)
-                let latencyLogTextArea = document.getElementById('latencyLog')
-                latencyLogTextArea.innerHTML += `STT latency: ${sttLatency} ms\n`
-                chunkString = chunkString.replace(sttLatencyRegex, '')
-            }
-
-            if (firstTokenLatencyRegex.test(chunkString)) {
-                let aoaiFirstTokenLatency = parseInt(firstTokenLatencyRegex.exec(chunkString)[0].replace('<FTL>', '').replace('</FTL>', ''))
-                // console.log(`AOAI first token latency: ${aoaiFirstTokenLatency} ms`)
-                chunkString = chunkString.replace(firstTokenLatencyRegex, '')
-            }
-
-            if (firstSentenceLatencyRegex.test(chunkString)) {
-                let aoaiFirstSentenceLatency = parseInt(firstSentenceLatencyRegex.exec(chunkString)[0].replace('<FSL>', '').replace('</FSL>', ''))
-                chatResponseReceivedTime = new Date()
-                console.log(`AOAI latency: ${aoaiFirstSentenceLatency} ms`)
-                let latencyLogTextArea = document.getElementById('latencyLog')
-                latencyLogTextArea.innerHTML += `AOAI latency: ${aoaiFirstSentenceLatency} ms\n`
-                latencyLogTextArea.scrollTop = latencyLogTextArea.scrollHeight
-                chunkString = chunkString.replace(firstSentenceLatencyRegex, '')
-            }
-
-            chatHistoryTextArea.innerHTML += `${chunkString}`
-            if (chatHistoryTextArea.innerHTML.startsWith('\n\n')) {
-                chatHistoryTextArea.innerHTML = chatHistoryTextArea.innerHTML.substring(2)
-            }
-
-            chatHistoryTextArea.scrollTop = chatHistoryTextArea.scrollHeight
-        } else if (path === 'api.event') {
-            console.log("[" + (new Date()).toISOString() + "] WebSocket event received: " + data.eventType)
-            if (data.eventType === 'SPEECH_SYNTHESIZER_DISCONNECTED') {
-                if (document.getElementById('autoReconnectAvatar').checked && !userClosedSession && !isReconnecting) {
-                    // No longer reconnect when there is no interaction for a while
-                    if (new Date() - lastInteractionTime < 300000) {
-                        // Session disconnected unexpectedly, need reconnect
-                        console.log(`[${(new Date()).toISOString()}] The speech synthesizer got disconnected unexpectedly, need reconnect.`)
-                        isReconnecting = true
-                        connectAvatar()
-                        createSpeechRecognizer()
-                    }
-                }
-            }
+    const xhr = new XMLHttpRequest()
+    if (privateEndpointEnabled) {
+        xhr.open("GET", `https://${privateEndpoint}/tts/cognitiveservices/avatar/relay/token/v1`)
+    } else {
+        xhr.open("GET", `https://${cogSvcRegion}.tts.speech.microsoft.com/cognitiveservices/avatar/relay/token/v1`)
+    }
+    xhr.setRequestHeader("Ocp-Apim-Subscription-Key", cogSvcSubKey)
+    xhr.addEventListener("readystatechange", function () {
+        if (this.readyState === 4) {
+            const responseData = JSON.parse(this.responseText)
+            const iceServerUrl = responseData.Urls[0]
+            const iceServerUsername = responseData.Username
+            const iceServerCredential = responseData.Password
+            setupWebRTC(iceServerUrl, iceServerUsername, iceServerCredential)
         }
     })
+    xhr.send()
+}
+
+// Disconnect from avatar service
+function disconnectAvatar() {
+    if (avatarSynthesizer !== undefined) {
+        avatarSynthesizer.close()
+    }
+
+    if (speechRecognizer !== undefined) {
+        speechRecognizer.stopContinuousRecognitionAsync()
+        speechRecognizer.close()
+    }
+
+    sessionActive = false
 }
 
 // Setup WebRTC
@@ -163,11 +143,10 @@ function setupWebRTC(iceServerUrl, iceServerUsername, iceServerCredential) {
     // Create WebRTC peer connection
     peerConnection = new RTCPeerConnection({
         iceServers: [{
-            urls: [ iceServerUrl ],
+            urls: [iceServerUrl],
             username: iceServerUsername,
             credential: iceServerCredential
-        }],
-        iceTransportPolicy: 'relay'
+        }]
     })
 
     // Fetch WebRTC video stream and mount it to an HTML video element
@@ -201,15 +180,15 @@ function setupWebRTC(iceServerUrl, iceServerUsername, iceServerCredential) {
             videoElement.autoplay = true
             videoElement.playsInline = true
 
-            // Continue speaking if there are unfinished sentences while reconnecting
-            if (isReconnecting) {
-                fetch('/api/chat/continueSpeaking', {
-                    method: 'POST',
-                    headers: {
-                        'ClientId': clientId
-                    },
-                    body: ''
-                })
+            // Continue speaking if there are unfinished sentences
+            if (repeatSpeakingSentenceAfterReconnection) {
+                if (speakingText !== '') {
+                    speakNext(speakingText, 0, true)
+                }
+            } else {
+                if (spokenTextQueue.length > 0) {
+                    speakNext(spokenTextQueue.shift())
+                }
             }
 
             videoElement.onplaying = () => {
@@ -229,7 +208,6 @@ function setupWebRTC(iceServerUrl, iceServerUsername, iceServerCredential) {
                 document.getElementById('stopSession').disabled = false
                 document.getElementById('remoteVideo').style.width = '960px'
                 document.getElementById('chatHistory').hidden = false
-                document.getElementById('latencyLog').hidden = false
                 document.getElementById('showTypeMessage').disabled = false
 
                 if (document.getElementById('useLocalVideoForIdle').checked) {
@@ -249,39 +227,37 @@ function setupWebRTC(iceServerUrl, iceServerUsername, iceServerCredential) {
     peerConnection.addEventListener("datachannel", event => {
         peerConnectionDataChannel = event.channel
         peerConnectionDataChannel.onmessage = e => {
-            console.log("[" + (new Date()).toISOString() + "] WebRTC event received: " + e.data)
+            let subtitles = document.getElementById('subtitles')
+            const webRTCEvent = JSON.parse(e.data)
+            if (webRTCEvent.event.eventType === 'EVENT_TYPE_TURN_START' && document.getElementById('showSubtitles').checked) {
+                subtitles.hidden = false
+                subtitles.innerHTML = speakingText
+            } else if (webRTCEvent.event.eventType === 'EVENT_TYPE_SESSION_END' || webRTCEvent.event.eventType === 'EVENT_TYPE_SWITCH_TO_IDLE') {
+                subtitles.hidden = true
+                if (webRTCEvent.event.eventType === 'EVENT_TYPE_SESSION_END') {
+                    if (document.getElementById('autoReconnectAvatar').checked && !userClosedSession && !isReconnecting) {
+                        // No longer reconnect when there is no interaction for a while
+                        if (new Date() - lastInteractionTime < 300000) {
+                            // Session disconnected unexpectedly, need reconnect
+                            console.log(`[${(new Date()).toISOString()}] The WebSockets got disconnected, need reconnect.`)
+                            isReconnecting = true
 
-            if (e.data.includes("EVENT_TYPE_SWITCH_TO_SPEAKING")) {
-                if (chatResponseReceivedTime !== undefined) {
-                    let speakStartTime = new Date()
-                    let ttsLatency = speakStartTime - chatResponseReceivedTime
-                    console.log(`TTS latency: ${ttsLatency} ms`)
-                    let latencyLogTextArea = document.getElementById('latencyLog')
-                    latencyLogTextArea.innerHTML += `TTS latency: ${ttsLatency} ms\n\n`
-                    latencyLogTextArea.scrollTop = latencyLogTextArea.scrollHeight
-                    chatResponseReceivedTime = undefined
-                }
+                            // Remove data channel onmessage callback to avoid duplicatedly triggering reconnect
+                            peerConnectionDataChannel.onmessage = null
 
-                isSpeaking = true
-                document.getElementById('stopSpeaking').disabled = false
-            } else if (e.data.includes("EVENT_TYPE_SWITCH_TO_IDLE")) {
-                isSpeaking = false
-                lastSpeakTime = new Date()
-                document.getElementById('stopSpeaking').disabled = true
-            } else if (e.data.includes("EVENT_TYPE_SESSION_END")) {
-                if (document.getElementById('autoReconnectAvatar').checked && !userClosedSession && !isReconnecting) {
-                    // No longer reconnect when there is no interaction for a while
-                    if (new Date() - lastInteractionTime < 300000) {
-                        // Session disconnected unexpectedly, need reconnect
-                        console.log(`[${(new Date()).toISOString()}] The session ended unexpectedly, need reconnect.`)
-                        isReconnecting = true
-                        // Remove data channel onmessage callback to avoid duplicatedly triggering reconnect
-                        peerConnectionDataChannel.onmessage = null
-                        connectAvatar()
-                        createSpeechRecognizer()
+                            // Release the existing avatar connection
+                            if (avatarSynthesizer !== undefined) {
+                                avatarSynthesizer.close()
+                            }
+
+                            // Setup a new avatar connection
+                            connectAvatar()
+                        }
                     }
                 }
             }
+
+            console.log("[" + (new Date()).toISOString() + "] WebRTC event received: " + e.data)
         }
     })
 
@@ -303,211 +279,368 @@ function setupWebRTC(iceServerUrl, iceServerUsername, iceServerCredential) {
     peerConnection.addTransceiver('video', { direction: 'sendrecv' })
     peerConnection.addTransceiver('audio', { direction: 'sendrecv' })
 
-    // Connect to avatar service when ICE candidates gathering is done
-    iceGatheringDone = false
-
-    peerConnection.onicecandidate = e => {
-        if (!e.candidate && !iceGatheringDone) {
-            iceGatheringDone = true
-            connectToAvatarService(peerConnection)
-        }
-    }
-
-    peerConnection.createOffer().then(sdp => {
-        peerConnection.setLocalDescription(sdp).then(() => { setTimeout(() => {
-            if (!iceGatheringDone) {
-                iceGatheringDone = true
-                connectToAvatarService(peerConnection)
-            }
-        }, 2000) })
-    })
-}
-
-// Connect to TTS Avatar Service
-function connectToAvatarService(peerConnection) {
-    let localSdp = btoa(JSON.stringify(peerConnection.localDescription))
-    let headers = {
-        'ClientId': clientId,
-        'AvatarCharacter': document.getElementById('talkingAvatarCharacter').value,
-        'AvatarStyle': document.getElementById('talkingAvatarStyle').value,
-        'IsCustomAvatar': document.getElementById('customizedAvatar').checked
-    }
-
-    if (isReconnecting) {
-        headers['Reconnect'] = true
-    }
-
-    if (document.getElementById('azureOpenAIDeploymentName').value !== '') {
-        headers['AoaiDeploymentName'] = document.getElementById('azureOpenAIDeploymentName').value
-    }
-
-    if (document.getElementById('enableOyd').checked && document.getElementById('azureCogSearchIndexName').value !== '') {
-        headers['CognitiveSearchIndexName'] = document.getElementById('azureCogSearchIndexName').value
-    }
-
-    if (document.getElementById('ttsVoice').value !== '') {
-        headers['TtsVoice'] = document.getElementById('ttsVoice').value
-    }
-
-    if (document.getElementById('customVoiceEndpointId').value !== '') {
-        headers['CustomVoiceEndpointId'] = document.getElementById('customVoiceEndpointId').value
-    }
-
-    if (document.getElementById('personalVoiceSpeakerProfileID').value !== '') {
-        headers['PersonalVoiceSpeakerProfileId'] = document.getElementById('personalVoiceSpeakerProfileID').value
-    }
-
-    fetch('/api/connectAvatar', {
-        method: 'POST',
-        headers: headers,
-        body: localSdp
-    })
-    .then(response => {
-        if (response.ok) {
-            response.text().then(text => {
-                const remoteSdp = text
-                peerConnection.setRemoteDescription(new RTCSessionDescription(JSON.parse(atob(remoteSdp))))
-            })
+    // start avatar, establish WebRTC connection
+    avatarSynthesizer.startAvatarAsync(peerConnection).then((r) => {
+        if (r.reason === SpeechSDK.ResultReason.SynthesizingAudioCompleted) {
+            console.log("[" + (new Date()).toISOString() + "] Avatar started. Result ID: " + r.resultId)
         } else {
+            console.log("[" + (new Date()).toISOString() + "] Unable to start avatar. Result ID: " + r.resultId)
+            if (r.reason === SpeechSDK.ResultReason.Canceled) {
+                let cancellationDetails = SpeechSDK.CancellationDetails.fromResult(r)
+                if (cancellationDetails.reason === SpeechSDK.CancellationReason.Error) {
+                    console.log(cancellationDetails.errorDetails)
+                };
+
+                console.log("Unable to start avatar: " + cancellationDetails.errorDetails);
+            }
             document.getElementById('startSession').disabled = false;
             document.getElementById('configuration').hidden = false;
-            throw new Error(`Failed connecting to the Avatar service: ${response.status} ${response.statusText}`)
         }
-    })
+    }).catch(
+        (error) => {
+            console.log("[" + (new Date()).toISOString() + "] Avatar failed to start. Error: " + error)
+            document.getElementById('startSession').disabled = false
+            document.getElementById('configuration').hidden = false
+        }
+    )
 }
 
-// Handle user query. Send user query to the chat API and display the response.
-function handleUserQuery(userQuery) {
-    lastInteractionTime = new Date()
-    chatRequestSentTime = new Date()
-    if (socket !== undefined) {
-        socket.emit('message', { clientId: clientId, path: 'api.chat', systemPrompt: document.getElementById('prompt').value, userQuery: userQuery })
-        isFirstResponseChunk = true
+// Initialize messages
+function initMessages() {
+    messages = []
+
+    if (dataSources.length === 0) {
+        let systemPrompt = document.getElementById('prompt').value
+        let systemMessage = {
+            role: 'system',
+            content: systemPrompt
+        }
+
+        messages.push(systemMessage)
+    }
+}
+
+// Set data sources for chat API
+function setDataSources(azureCogSearchEndpoint, azureCogSearchApiKey, azureCogSearchIndexName) {
+    let dataSource = {
+        type: 'AzureCognitiveSearch',
+        parameters: {
+            endpoint: azureCogSearchEndpoint,
+            key: azureCogSearchApiKey,
+            indexName: azureCogSearchIndexName,
+            semanticConfiguration: '',
+            queryType: 'simple',
+            fieldsMapping: {
+                contentFieldsSeparator: '\n',
+                contentFields: ['content'],
+                filepathField: null,
+                titleField: 'title',
+                urlField: null
+            },
+            inScope: true,
+            roleInformation: document.getElementById('prompt').value
+        }
+    }
+
+    dataSources.push(dataSource)
+}
+
+// Do HTML encoding on given text
+function htmlEncode(text) {
+    const entityMap = {
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;',
+        '/': '&#x2F;'
+    };
+
+    return String(text).replace(/[&<>"'\/]/g, (match) => entityMap[match])
+}
+
+// Speak the given text
+function speak(text, endingSilenceMs = 0) {
+    if (isSpeaking) {
+        spokenTextQueue.push(text)
         return
     }
 
-    fetch('/api/chat', {
+    speakNext(text, endingSilenceMs)
+}
+
+function speakNext(text, endingSilenceMs = 0, skipUpdatingChatHistory = false) {
+    let ttsVoice = document.getElementById('ttsVoice').value
+    let ssml = `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xmlns:mstts='http://www.w3.org/2001/mstts' xml:lang='en-US'><voice name='${ttsVoice}'><mstts:leadingsilence-exact value='0'/>${htmlEncode(text)}</voice></speak>`
+    if (endingSilenceMs > 0) {
+        ssml = `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xmlns:mstts='http://www.w3.org/2001/mstts' xml:lang='en-US'><voice name='${ttsVoice}'><mstts:leadingsilence-exact value='0'/>${htmlEncode(text)}<break time='${endingSilenceMs}ms' /></voice></speak>`
+    }
+
+    if (enableDisplayTextAlignmentWithSpeech && !skipUpdatingChatHistory) {
+        let chatHistoryTextArea = document.getElementById('chatHistory')
+        chatHistoryTextArea.innerHTML += text.replace(/\n/g, '<br/>')
+        chatHistoryTextArea.scrollTop = chatHistoryTextArea.scrollHeight
+    }
+
+    lastSpeakTime = new Date()
+    isSpeaking = true
+    speakingText = text
+    document.getElementById('stopSpeaking').disabled = false
+    avatarSynthesizer.speakSsmlAsync(ssml).then(
+        (result) => {
+            if (result.reason === SpeechSDK.ResultReason.SynthesizingAudioCompleted) {
+                console.log(`Speech synthesized to speaker for text [ ${text} ]. Result ID: ${result.resultId}`)
+                lastSpeakTime = new Date()
+            } else {
+                console.log(`Error occurred while speaking the SSML. Result ID: ${result.resultId}`)
+            }
+
+            speakingText = ''
+
+            if (spokenTextQueue.length > 0) {
+                speakNext(spokenTextQueue.shift())
+            } else {
+                isSpeaking = false
+                document.getElementById('stopSpeaking').disabled = true
+            }
+        }).catch(
+            (error) => {
+                console.log(`Error occurred while speaking the SSML: [ ${error} ]`)
+
+                speakingText = ''
+
+                if (spokenTextQueue.length > 0) {
+                    speakNext(spokenTextQueue.shift())
+                } else {
+                    isSpeaking = false
+                    document.getElementById('stopSpeaking').disabled = true
+                }
+            }
+        )
+}
+
+function stopSpeaking() {
+    lastInteractionTime = new Date()
+    spokenTextQueue = []
+    avatarSynthesizer.stopSpeakingAsync().then(
+        () => {
+            isSpeaking = false
+            document.getElementById('stopSpeaking').disabled = true
+            console.log("[" + (new Date()).toISOString() + "] Stop speaking request sent.")
+        }
+    ).catch(
+        (error) => {
+            console.log("Error occurred while stopping speaking: " + error)
+        }
+    )
+}
+
+function handleUserQuery(userQuery, userQueryHTML, imgUrlPath) {
+    lastInteractionTime = new Date()
+    let contentMessage = userQuery
+    if (imgUrlPath.trim()) {
+        contentMessage = [
+            {
+                "type": "text",
+                "text": userQuery
+            },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": imgUrlPath
+                }
+            }
+        ]
+    }
+    let chatMessage = {
+        role: 'user',
+        content: contentMessage
+    }
+
+    messages.push(chatMessage)
+    let chatHistoryTextArea = document.getElementById('chatHistory')
+    if (chatHistoryTextArea.innerHTML !== '' && !chatHistoryTextArea.innerHTML.endsWith('\n\n')) {
+        chatHistoryTextArea.innerHTML += '\n\n'
+    }
+
+    chatHistoryTextArea.innerHTML += imgUrlPath.trim() ? "<br/><br/>User: " + userQueryHTML : "<br/><br/>User: " + userQuery + "<br/>";
+
+    chatHistoryTextArea.scrollTop = chatHistoryTextArea.scrollHeight
+
+    // Stop previous speaking if there is any
+    if (isSpeaking) {
+        stopSpeaking()
+    }
+
+    // For 'bring your data' scenario, chat API currently has long (4s+) latency
+    // We return some quick reply here before the chat API returns to mitigate.
+    if (dataSources.length > 0 && enableQuickReply) {
+        speak(getQuickReply(), 2000)
+    }
+
+    const azureOpenAIEndpoint = document.getElementById('azureOpenAIEndpoint').value
+    const azureOpenAIApiKey = document.getElementById('azureOpenAIApiKey').value
+    const azureOpenAIDeploymentName = document.getElementById('azureOpenAIDeploymentName').value
+
+    let url = "{AOAIEndpoint}/openai/deployments/{AOAIDeployment}/chat/completions?api-version=2023-06-01-preview".replace("{AOAIEndpoint}", azureOpenAIEndpoint).replace("{AOAIDeployment}", azureOpenAIDeploymentName)
+    let body = JSON.stringify({
+        messages: messages,
+        stream: true
+    })
+
+    if (dataSources.length > 0) {
+        url = "{AOAIEndpoint}/openai/deployments/{AOAIDeployment}/extensions/chat/completions?api-version=2023-06-01-preview".replace("{AOAIEndpoint}", azureOpenAIEndpoint).replace("{AOAIDeployment}", azureOpenAIDeploymentName)
+        body = JSON.stringify({
+            dataSources: dataSources,
+            messages: messages,
+            stream: true
+        })
+    }
+
+    let assistantReply = ''
+    let toolContent = ''
+    let spokenSentence = ''
+    let displaySentence = ''
+
+    fetch(url, {
         method: 'POST',
         headers: {
-            'ClientId': clientId,
-            'SystemPrompt': document.getElementById('prompt').value,
-            'Content-Type': 'text/plain'
+            'api-key': azureOpenAIApiKey,
+            'Content-Type': 'application/json'
         },
-        body: userQuery
+        body: body
     })
-    .then(response => {
-        if (!response.ok) {
-            throw new Error(`Chat API response status: ${response.status} ${response.statusText}`)
-        }
+        .then(response => {
+            if (!response.ok) {
+                throw new Error(`Chat API response status: ${response.status} ${response.statusText}`)
+            }
 
-        let chatHistoryTextArea = document.getElementById('chatHistory')
-        chatHistoryTextArea.innerHTML += 'Assistant: '
+            let chatHistoryTextArea = document.getElementById('chatHistory')
+            chatHistoryTextArea.innerHTML += imgUrlPath.trim() ? 'Assistant: ' : '<br/>Assistant: '
 
-        const reader = response.body.getReader()
+            const reader = response.body.getReader()
 
-        // Function to recursively read chunks from the stream
-        function read() {
-            return reader.read().then(({ value, done }) => {
-                // Check if there is still data to read
-                if (done) {
-                    // Stream complete
-                    return
-                }
-
-                // Process the chunk of data (value)
-                let chunkString = new TextDecoder().decode(value, { stream: true })
-
-                if (firstTokenLatencyRegex.test(chunkString)) {
-                    let aoaiFirstTokenLatency = parseInt(firstTokenLatencyRegex.exec(chunkString)[0].replace('<FTL>', '').replace('</FTL>', ''))
-                    // console.log(`AOAI first token latency: ${aoaiFirstTokenLatency} ms`)
-                    chunkString = chunkString.replace(firstTokenLatencyRegex, '')
-                    if (chunkString === '') {
-                        return read()
+            // Function to recursively read chunks from the stream
+            function read(previousChunkString = '') {
+                return reader.read().then(({ value, done }) => {
+                    // Check if there is still data to read
+                    if (done) {
+                        // Stream complete
+                        return
                     }
-                }
 
-                if (firstSentenceLatencyRegex.test(chunkString)) {
-                    let aoaiFirstSentenceLatency = parseInt(firstSentenceLatencyRegex.exec(chunkString)[0].replace('<FSL>', '').replace('</FSL>', ''))
-                    chatResponseReceivedTime = new Date()
-                    let chatLatency = chatResponseReceivedTime - chatRequestSentTime
-                    let appServiceLatency = chatLatency - aoaiFirstSentenceLatency
-                    console.log(`App service latency: ${appServiceLatency} ms`)
-                    console.log(`AOAI latency: ${aoaiFirstSentenceLatency} ms`)
-                    let latencyLogTextArea = document.getElementById('latencyLog')
-                    latencyLogTextArea.innerHTML += `App service latency: ${appServiceLatency} ms\n`
-                    latencyLogTextArea.innerHTML += `AOAI latency: ${aoaiFirstSentenceLatency} ms\n`
-                    latencyLogTextArea.scrollTop = latencyLogTextArea.scrollHeight
-                    chunkString = chunkString.replace(firstSentenceLatencyRegex, '')
-                    if (chunkString === '') {
-                        return read()
+                    // Process the chunk of data (value)
+                    let chunkString = new TextDecoder().decode(value, { stream: true })
+                    if (previousChunkString !== '') {
+                        // Concatenate the previous chunk string in case it is incomplete
+                        chunkString = previousChunkString + chunkString
                     }
-                }
 
-                chatHistoryTextArea.innerHTML += `${chunkString}`
-                chatHistoryTextArea.scrollTop = chatHistoryTextArea.scrollHeight
+                    if (!chunkString.endsWith('}\n\n') && !chunkString.endsWith('[DONE]\n\n')) {
+                        // This is a incomplete chunk, read the next chunk
+                        return read(chunkString)
+                    }
 
-                // Continue reading the next chunk
-                return read()
-            })
-        }
+                    chunkString.split('\n\n').forEach((line) => {
+                        try {
+                            if (line.startsWith('data:') && !line.endsWith('[DONE]')) {
+                                const responseJson = JSON.parse(line.substring(5).trim())
+                                let responseToken = undefined
+                                if (dataSources.length === 0) {
+                                    responseToken = responseJson.choices[0].delta.content
+                                } else {
+                                    let role = responseJson.choices[0].messages[0].delta.role
+                                    if (role === 'tool') {
+                                        toolContent = responseJson.choices[0].messages[0].delta.content
+                                    } else {
+                                        responseToken = responseJson.choices[0].messages[0].delta.content
+                                        if (responseToken !== undefined) {
+                                            if (byodDocRegex.test(responseToken)) {
+                                                responseToken = responseToken.replace(byodDocRegex, '').trim()
+                                            }
 
-        // Start reading the stream
-        return read()
-    })
-}
+                                            if (responseToken === '[DONE]') {
+                                                responseToken = undefined
+                                            }
+                                        }
+                                    }
+                                }
 
-// Handle local video. If the user is not speaking for 15 seconds, switch to local video.
-function handleLocalVideo() {
-    if (lastSpeakTime === undefined) {
-        return
-    }
+                                if (responseToken !== undefined && responseToken !== null) {
+                                    assistantReply += responseToken // build up the assistant message
+                                    displaySentence += responseToken // build up the display sentence
 
-    let currentTime = new Date()
-    if (currentTime - lastSpeakTime > 15000) {
-        if (document.getElementById('useLocalVideoForIdle').checked && sessionActive && !isSpeaking) {
-            disconnectAvatar()
-            userClosedSession = true // Indicating the session was closed on purpose, not due to network issue
-            document.getElementById('localVideo').hidden = false
-            document.getElementById('remoteVideo').style.width = '0.1px'
-            sessionActive = false
-        }
-    }
-}
+                                    // console.log(`Current token: ${responseToken}`)
 
-// Check server status
-function checkServerStatus() {
-    fetch('/api/getStatus', {
-        method: 'GET',
-        headers: {
-            'ClientId': clientId
-        }
-    })
-    .then(response => {
-        if (response.ok) {
-            response.text().then(text => {
-                responseJson = JSON.parse(text)
-                synthesizerConnected = responseJson.speechSynthesizerConnected
-                if (speechSynthesizerConnected === true && synthesizerConnected === false) {
-                    console.log(`[${(new Date()).toISOString()}] The speech synthesizer connection is closed.`)
-                    if (document.getElementById('autoReconnectAvatar').checked && !userClosedSession && !isReconnecting) {
-                        // No longer reconnect when there is no interaction for a while
-                        if (new Date() - lastInteractionTime < 300000) {
-                            // Session disconnected unexpectedly, need reconnect
-                            console.log(`[${(new Date()).toISOString()}] The speech synthesizer got disconnected unexpectedly, need reconnect.`)
-                            isReconnecting = true
-                            connectAvatar()
-                            createSpeechRecognizer()
+                                    if (responseToken === '\n' || responseToken === '\n\n') {
+                                        spokenSentence += responseToken
+                                        speak(spokenSentence)
+                                        spokenSentence = ''
+                                    } else {
+                                        spokenSentence += responseToken // build up the spoken sentence
+
+                                        responseToken = responseToken.replace(/\n/g, '')
+                                        if (responseToken.length === 1 || responseToken.length === 2) {
+                                            for (let i = 0; i < sentenceLevelPunctuations.length; ++i) {
+                                                let sentenceLevelPunctuation = sentenceLevelPunctuations[i]
+                                                if (responseToken.startsWith(sentenceLevelPunctuation)) {
+                                                    speak(spokenSentence)
+                                                    spokenSentence = ''
+                                                    break
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (error) {
+                            console.log(`Error occurred while parsing the response: ${error}`)
+                            console.log(chunkString)
                         }
+                    })
+
+                    if (!enableDisplayTextAlignmentWithSpeech) {
+                        chatHistoryTextArea.innerHTML += displaySentence.replace(/\n/g, '<br/>')
+                        chatHistoryTextArea.scrollTop = chatHistoryTextArea.scrollHeight
+                        displaySentence = ''
                     }
+
+                    // Continue reading the next chunk
+                    return read()
+                })
+            }
+
+            // Start reading the stream
+            return read()
+        })
+        .then(() => {
+            if (spokenSentence !== '') {
+                speak(spokenSentence)
+                spokenSentence = ''
+            }
+
+            if (dataSources.length > 0) {
+                let toolMessage = {
+                    role: 'tool',
+                    content: toolContent
                 }
 
-                speechSynthesizerConnected = synthesizerConnected
-            })
-        }
-    })
+                messages.push(toolMessage)
+            }
+
+            let assistantMessage = {
+                role: 'assistant',
+                content: assistantReply
+            }
+
+            messages.push(assistantMessage)
+        })
 }
 
-// Check whether the avatar video stream is hung
+function getQuickReply() {
+    return quickReplies[Math.floor(Math.random() * quickReplies.length)]
+}
+
 function checkHung() {
     // Check whether the avatar video stream is hung, by checking whether the video time is advancing
     let videoElement = document.getElementById('videoPlayer')
@@ -526,8 +659,13 @@ function checkHung() {
                             isReconnecting = true
                             // Remove data channel onmessage callback to avoid duplicatedly triggering reconnect
                             peerConnectionDataChannel.onmessage = null
+                            // Release the existing avatar connection
+                            if (avatarSynthesizer !== undefined) {
+                                avatarSynthesizer.close()
+                            }
+
+                            // Setup a new avatar connection
                             connectAvatar()
-                            createSpeechRecognizer()
                         }
                     }
                 }
@@ -536,30 +674,31 @@ function checkHung() {
     }
 }
 
-window.onload = () => {
-    clientId = document.getElementById('clientId').value
-    enableWebSockets = document.getElementById('enableWebSockets').value === 'True'
-
-    if (!enableWebSockets) {
-        setInterval(() => {
-            checkServerStatus()
-        }, 2000) // Check server status every 2 seconds
+function checkLastSpeak() {
+    if (lastSpeakTime === undefined) {
+        return
     }
 
+    let currentTime = new Date()
+    if (currentTime - lastSpeakTime > 15000) {
+        if (document.getElementById('useLocalVideoForIdle').checked && sessionActive && !isSpeaking) {
+            disconnectAvatar()
+            document.getElementById('localVideo').hidden = false
+            document.getElementById('remoteVideo').style.width = '0.1px'
+            sessionActive = false
+        }
+    }
+}
+
+window.onload = () => {
     setInterval(() => {
         checkHung()
+        checkLastSpeak()
     }, 2000) // Check session activity every 2 seconds
 }
 
 window.startSession = () => {
     lastInteractionTime = new Date()
-    if (enableWebSockets) {
-        setupWebSocket()
-    }
-
-    userClosedSession = false
-
-    createSpeechRecognizer()
     if (document.getElementById('useLocalVideoForIdle').checked) {
         document.getElementById('startSession').disabled = true
         document.getElementById('configuration').hidden = true
@@ -568,37 +707,12 @@ window.startSession = () => {
         document.getElementById('localVideo').hidden = false
         document.getElementById('remoteVideo').style.width = '0.1px'
         document.getElementById('chatHistory').hidden = false
-        document.getElementById('latencyLog').hidden = false
         document.getElementById('showTypeMessage').disabled = false
         return
     }
 
+    userClosedSession = false
     connectAvatar()
-}
-
-window.stopSpeaking = () => {
-    lastInteractionTime = new Date()
-    document.getElementById('stopSpeaking').disabled = true
-
-    if (socket !== undefined) {
-        socket.emit('message', { clientId: clientId, path: 'api.stopSpeaking' })
-        return
-    }
-
-    fetch('/api/stopSpeaking', {
-        method: 'POST',
-        headers: {
-            'ClientId': clientId
-        },
-        body: ''
-    })
-    .then(response => {
-        if (response.ok) {
-            console.log('Successfully stopped speaking.')
-        } else {
-            throw new Error(`Failed to stop speaking: ${response.status} ${response.statusText}`)
-        }
-    })
 }
 
 window.stopSession = () => {
@@ -608,61 +722,27 @@ window.stopSession = () => {
     document.getElementById('stopSession').disabled = true
     document.getElementById('configuration').hidden = false
     document.getElementById('chatHistory').hidden = true
-    document.getElementById('latencyLog').hidden = true
     document.getElementById('showTypeMessage').checked = false
     document.getElementById('showTypeMessage').disabled = true
     document.getElementById('userMessageBox').hidden = true
+    document.getElementById('uploadImgIcon').hidden = true
     if (document.getElementById('useLocalVideoForIdle').checked) {
         document.getElementById('localVideo').hidden = true
     }
 
-    userClosedSession = true // Indicating the session was closed by user on purpose, not due to network issue
-    disconnectAvatar(true)
+    userClosedSession = true
+    disconnectAvatar()
 }
 
 window.clearChatHistory = () => {
     lastInteractionTime = new Date()
-    fetch('/api/chat/clearHistory', {
-        method: 'POST',
-        headers: {
-            'ClientId': clientId,
-            'SystemPrompt': document.getElementById('prompt').value
-        },
-        body: ''
-    })
-    .then(response => {
-        if (response.ok) {
-            document.getElementById('chatHistory').innerHTML = ''
-            document.getElementById('latencyLog').innerHTML = ''
-        } else {
-            throw new Error(`Failed to clear chat history: ${response.status} ${response.statusText}`)
-        }
-    })
+    document.getElementById('chatHistory').innerHTML = ''
+    initMessages()
 }
 
 window.microphone = () => {
     lastInteractionTime = new Date()
     if (document.getElementById('microphone').innerHTML === 'Stop Microphone') {
-        // Stop microphone for websocket mode
-        if (socket !== undefined) {
-            document.getElementById('microphone').disabled = true
-            fetch('/api/disconnectSTT', {
-                method: 'POST',
-                headers: {
-                    'ClientId': clientId
-                },
-                body: ''
-            })
-            .then(() => {
-                document.getElementById('microphone').innerHTML = 'Start Microphone'
-                document.getElementById('microphone').disabled = false
-                if (audioContext !== undefined) {
-                    audioContext.close()
-                    audioContext = undefined
-                }
-            })
-        }
-
         // Stop microphone
         document.getElementById('microphone').disabled = true
         speechRecognizer.stopContinuousRecognitionAsync(
@@ -673,87 +753,6 @@ window.microphone = () => {
                 console.log("Failed to stop continuous recognition:", err)
                 document.getElementById('microphone').disabled = false
             })
-
-        return
-    }
-
-    // Start microphone for websocket mode
-    if (socket !== undefined) {
-        document.getElementById('microphone').disabled = true
-        // Audio worklet script (https://developer.chrome.com/blog/audio-worklet) for recording audio
-        const audioWorkletScript = `class MicAudioWorkletProcessor extends AudioWorkletProcessor {
-                constructor(options) {
-                    super(options)
-                }
-
-                process(inputs, outputs, parameters) {
-                    const input = inputs[0]
-                    const output = []
-                    for (let channel = 0; channel < input.length; channel += 1) {
-                        output[channel] = input[channel]
-                    }
-                    this.port.postMessage(output[0])
-                    return true
-                }
-            }
-
-            registerProcessor('mic-audio-worklet-processor', MicAudioWorkletProcessor)`
-        const audioWorkletScriptBlob = new Blob([audioWorkletScript], { type: 'application/javascript; charset=utf-8' })
-        const audioWorkletScriptUrl = URL.createObjectURL(audioWorkletScriptBlob)
-
-        fetch('/api/connectSTT', {
-            method: 'POST',
-            headers: {
-                'ClientId': clientId,
-                'SystemPrompt': document.getElementById('prompt').value
-            },
-            body: ''
-        })
-        .then(response => {
-            document.getElementById('microphone').disabled = false
-            if (response.ok) {
-                document.getElementById('microphone').innerHTML = 'Stop Microphone'
-
-                navigator.mediaDevices
-                .getUserMedia({
-                    audio: {
-                        echoCancellation: true,
-                        noiseSuppression: true,
-                        sampleRate: 16000
-                    }
-                })
-                .then((stream) => {
-                    audioContext = new AudioContext({ sampleRate: 16000 })
-                    const audioSource = audioContext.createMediaStreamSource(stream)
-                    audioContext.audioWorklet
-                        .addModule(audioWorkletScriptUrl)
-                        .then(() => {
-                            const audioWorkletNode = new AudioWorkletNode(audioContext, 'mic-audio-worklet-processor')
-                            audioWorkletNode.port.onmessage = (e) => {
-                                const audioDataFloat32 = e.data
-                                const audioDataInt16 = new Int16Array(audioDataFloat32.length)
-                                for (let i = 0; i < audioDataFloat32.length; i++) {
-                                    audioDataInt16[i] = Math.max(-0x8000, Math.min(0x7FFF, audioDataFloat32[i] * 0x7FFF))
-                                }
-                                const audioDataBytes = new Uint8Array(audioDataInt16.buffer)
-                                const audioDataBase64 = btoa(String.fromCharCode(...audioDataBytes))
-                                socket.emit('message', { clientId: clientId, path: 'api.audio', audioChunk: audioDataBase64 })
-                            }
-
-                            audioSource.connect(audioWorkletNode)
-                            audioWorkletNode.connect(audioContext.destination)
-                        })
-                        .catch((err) => {
-                            console.log('Failed to add audio worklet module:', err)
-                        })
-                })
-                .catch((err) => {
-                    console.log('Failed to get user media:', err)
-                })
-            } else {
-                throw new Error(`Failed to connect STT service: ${response.status} ${response.statusText}`)
-            }
-        })
 
         return
     }
@@ -771,27 +770,12 @@ window.microphone = () => {
     }
 
     document.getElementById('microphone').disabled = true
-    speechRecognizer.recognizing = async (s, e) => {
-        if (isFirstRecognizingEvent && isSpeaking) {
-            window.stopSpeaking()
-            isFirstRecognizingEvent = false
-        }
-    }
-
     speechRecognizer.recognized = async (s, e) => {
         if (e.result.reason === SpeechSDK.ResultReason.RecognizedSpeech) {
             let userQuery = e.result.text.trim()
             if (userQuery === '') {
                 return
             }
-
-            let recognitionResultReceivedTime = new Date()
-            let speechFinishedOffset = (e.result.offset + e.result.duration) / 10000
-            let sttLatency = recognitionResultReceivedTime - recognitionStartedTime - speechFinishedOffset
-            console.log(`STT latency: ${sttLatency} ms`)
-            let latencyLogTextArea = document.getElementById('latencyLog')
-            latencyLogTextArea.innerHTML += `STT latency: ${sttLatency} ms\n`
-            latencyLogTextArea.scrollTop = latencyLogTextArea.scrollHeight
 
             // Auto stop microphone when a phrase is recognized, when it's not continuous conversation mode
             if (!document.getElementById('continuousConversation').checked) {
@@ -806,21 +790,10 @@ window.microphone = () => {
                     })
             }
 
-            let chatHistoryTextArea = document.getElementById('chatHistory')
-            if (chatHistoryTextArea.innerHTML !== '' && !chatHistoryTextArea.innerHTML.endsWith('\n\n')) {
-                chatHistoryTextArea.innerHTML += '\n\n'
-            }
-
-            chatHistoryTextArea.innerHTML += "User: " + userQuery + '\n\n'
-            chatHistoryTextArea.scrollTop = chatHistoryTextArea.scrollHeight
-
-            handleUserQuery(userQuery)
-
-            isFirstRecognizingEvent = true
+            handleUserQuery(userQuery, "", "")
         }
     }
 
-    recognitionStartedTime = new Date()
     speechRecognizer.startContinuousRecognitionAsync(
         () => {
             document.getElementById('microphone').innerHTML = 'Stop Microphone'
@@ -842,29 +815,40 @@ window.updataEnableOyd = () => {
 window.updateTypeMessageBox = () => {
     if (document.getElementById('showTypeMessage').checked) {
         document.getElementById('userMessageBox').hidden = false
+        document.getElementById('uploadImgIcon').hidden = false
         document.getElementById('userMessageBox').addEventListener('keyup', (e) => {
             if (e.key === 'Enter') {
-                const userQuery = document.getElementById('userMessageBox').value
+                const userQuery = document.getElementById('userMessageBox').innerText
+                const messageBox = document.getElementById('userMessageBox')
+                const childImg = messageBox.querySelector("#picInput")
+                if (childImg) {
+                    childImg.style.width = "200px"
+                    childImg.style.height = "200px"
+                }
+                let userQueryHTML = messageBox.innerHTML.trim("")
+                if (userQueryHTML.startsWith('<img')) {
+                    userQueryHTML = "<br/>" + userQueryHTML
+                }
                 if (userQuery !== '') {
-                    let chatHistoryTextArea = document.getElementById('chatHistory')
-                    if (chatHistoryTextArea.innerHTML !== '' && !chatHistoryTextArea.innerHTML.endsWith('\n\n')) {
-                        chatHistoryTextArea.innerHTML += '\n\n'
-                    }
-
-                    chatHistoryTextArea.innerHTML += "User: " + userQuery.trim('\n') + '\n\n'
-                    chatHistoryTextArea.scrollTop = chatHistoryTextArea.scrollHeight
-
-                    if (isSpeaking) {
-                        window.stopSpeaking()
-                    }
-
-                    handleUserQuery(userQuery.trim('\n'))
-                    document.getElementById('userMessageBox').value = ''
+                    handleUserQuery(userQuery.trim(''), userQueryHTML, imgUrl)
+                    document.getElementById('userMessageBox').innerHTML = ''
+                    imgUrl = ""
                 }
             }
         })
+        document.getElementById('uploadImgIcon').addEventListener('click', function () {
+            imgUrl = "https://wallpaperaccess.com/full/528436.jpg"
+            const userMessage = document.getElementById("userMessageBox");
+            const childImg = userMessage.querySelector("#picInput");
+            if (childImg) {
+                userMessage.removeChild(childImg)
+            }
+            userMessage.innerHTML += '<br/><img id="picInput" src="https://wallpaperaccess.com/full/528436.jpg" style="width:100px;height:100px"/><br/><br/>'
+        });
     } else {
         document.getElementById('userMessageBox').hidden = true
+        document.getElementById('uploadImgIcon').hidden = true
+        imgUrl = ""
     }
 }
 
@@ -876,6 +860,18 @@ window.updateLocalVideoForIdle = () => {
     }
 }
 
-window.onbeforeunload = () => {
-    navigator.sendBeacon('/api/releaseClient', JSON.stringify({ clientId: clientId }))
+window.updatePrivateEndpoint = () => {
+    if (document.getElementById('enablePrivateEndpoint').checked) {
+        document.getElementById('showPrivateEndpointCheckBox').hidden = false
+    } else {
+        document.getElementById('showPrivateEndpointCheckBox').hidden = true
+    }
 }
+
+window.updateCustomAvatarBox = () => {
+    if (document.getElementById('customizedAvatar').checked) {
+        document.getElementById('useBuiltInVoice').disabled = false
+    } else {
+        document.getElementById('useBuiltInVoice').disabled = true
+        document.getElementById('useBuiltInVoice').checked = false
+    }
